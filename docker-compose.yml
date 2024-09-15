@@ -1,0 +1,30 @@
+
+
+services:
+  ldapproxy:
+    image: ldapproxy:poc
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      LDAP_PROXY_TOKEN_URL: "http://keycloak:8080/realms/test/protocol/openid-connect/token"
+      LDAP_PROXY_CLIENT_ID: "ldaptest"
+      LDAP_PROXY_CLIENT_SECRET: "e25V6BKes87K65PiiIKZOkL3leIIE1lR"
+    ports:
+      - 389:389
+
+  keycloak:
+    image: "quay.io/keycloak/keycloak:25.0.5"
+    restart: always
+    hostname: keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+    entrypoint: /bin/bash
+    command: -c "/opt/keycloak/bin/kc.sh start"
+    ports:
+      - 8080:8080
+    volumes:
+      - ./data/h2/:/opt/keycloak/data/h2/ # h2 database data dir
