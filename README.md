@@ -9,7 +9,7 @@ How to spawn a simple bind LDAP proxy for keycloak OIDC password grant in a nuts
 
 ## Disclaimer and license
 
-The principles and code presented here are only a proof of concept and shouldn't be used in production as is. Use it at your own risks. If you see any problem with the concept or its implementation feel free to open an issue or submit a pull request on github.
+The principles and code presented here are only a proof of concept and shouldn't be used in production as is. Use it at your own risks. If you see any problem with the concept or its implementation feel free to open an issue or submit a pull request on github. [https://github.com/please-openit/LDAP-Bind-Proxy](https://github.com/please-openit/LDAP-Bind-Proxy)
 
 This proof of concept is distributed under the Apache 2.0 license. See LICENSE.md in the git repository.
 
@@ -47,7 +47,7 @@ It is also possible to restrict that client by making it confidential, it is use
 
 ## Implementation
 
-A full demo is available on github, feel free to try it by yourself.
+A full demo is available on github, feel free to try it by yourself. [https://github.com/please-openit/LDAP-Bind-Proxy](https://github.com/please-openit/LDAP-Bind-Proxy)
 
 The proof of concept relies on LDAPProxy from twisted/ldaptor for convenience reasons. But could have been built on top of any up-to-date LDAP layer.
 
