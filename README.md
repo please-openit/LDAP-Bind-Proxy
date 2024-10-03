@@ -37,13 +37,13 @@ It is also a way more simple component that can be spawned anywhere you need it 
 
 ## How LDAP Bind proxy works
 
-Ldap bind proxy will simply "translate" LDAPBind request it receives to password grant request. To do so, it needs its own dedicated public client that allows direct access grant. 
+Ldap bind proxy will simply "translate" LDAPBind request it receives to password grant request. To do so, it needs its own dedicated confidential client that allows direct access grant.
 
 ![Sequence diagram of LDAP Bind proxy](image-2.png)
 
 The user logs-in as he always does, the legacy app sends a LDAPBindRequest as it always does, then the LDAP Bind proxy translates it to a password grant and gives a LDAP Bind Response according to the keycloak's response.
 
-It is also possible to restrict that client by making it confidential, it is useful if you don't want to allow password grant publicly. In that case LDAP Bind proxy must be deployed in a place where its secret is safe. (Not alongside the legacy app in this case)
+To ensure login security, the client must be confidential and the LDAP bind proxy must be deployed on a safe network and VM to keep its client credentials secret.
 
 ## Implementation
 
