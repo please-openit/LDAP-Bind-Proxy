@@ -1,2 +1,13 @@
 .venv
 .vscode
+__pycache__
+testing-assets
+*.pyc
+.DS_Store
+.env
+.idea
+*.log
+coverage
+html
+reports
+data

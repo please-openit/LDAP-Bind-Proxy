@@ -7,11 +7,17 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
+      LDAP_PROXY_TLS_CERTFILE: ./certs/server.crt
+      LDAP_PROXY_TLS_KEYFILE: ./certs/server.key
+      LDAP_PROXY_ENABLE_PLAIN: true
       LDAP_PROXY_TOKEN_URL: "http://keycloak:8080/realms/test/protocol/openid-connect/token"
       LDAP_PROXY_CLIENT_ID: "ldaptest"
       LDAP_PROXY_CLIENT_SECRET: "e25V6BKes87K65PiiIKZOkL3leIIE1lR"
     ports:
       - 389:389
+      - 636:636
+    volumes:
+      - ./testing-assets/:/opt/ldapoidc/certs/
 
   keycloak:
     image: "quay.io/keycloak/keycloak:25.0.5"
