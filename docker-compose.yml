@@ -13,6 +13,7 @@ services:
       LDAP_PROXY_TOKEN_URL: "http://keycloak:8080/realms/test/protocol/openid-connect/token"
       LDAP_PROXY_CLIENT_ID: "ldaptest"
       LDAP_PROXY_CLIENT_SECRET: "e25V6BKes87K65PiiIKZOkL3leIIE1lR"
+      LDAP_PROXY_REQUIRE_SECURE_BIND: false
     ports:
       - 389:389
       - 636:636
