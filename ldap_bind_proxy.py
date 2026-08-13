@@ -13,20 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ldaptor.protocols import pureldap
-from ldaptor.protocols.ldap import ldapserver, ldaperrors
-from twisted.internet import protocol, reactor, ssl as twisted_ssl, defer
-from twisted.internet.ssl import CertificateOptions, Certificate, PrivateCertificate
-from twisted.python import log
-import sys
-import requests
+import hashlib
+import json
 import os
 import ssl
-import json
-import jwt
-import hashlib
+import sys
 from datetime import datetime, timedelta
+
+import jwt
+import requests
+from ldaptor.protocols import pureldap
+from ldaptor.protocols.ldap import ldaperrors, ldapserver
 from OpenSSL import SSL, crypto
+from twisted.internet import defer, protocol, reactor
+from twisted.internet import ssl as twisted_ssl
+from twisted.internet.ssl import (Certificate, CertificateOptions,
+                                  PrivateCertificate)
+from twisted.python import log
 
 
 class Configuration():
@@ -47,6 +50,12 @@ class Configuration():
     5. LDAP_PROXY_ENABLE_PLAIN : Enable plain LDAP when TLS is configured (default false)
     6. LDAP_PROXY_TLS_CAFILE : Path to CA bundle for client certificate verification (default None)
     7. LDAP_PROXY_REQUIRE_CLIENT_CERT : Require client certificate for mTLS (default false)
+    8. LDAP_PROXY_REQUIRE_SECURE_BIND : Reject credentialed binds on connections
+       that are not encrypted (i.e. not LDAPS and not yet upgraded via
+       STARTTLS) (default true). Set to false to allow plaintext binds on
+       the plain LDAP listener (port 389 by default) - useful for local
+       testing or trusted networks, but credentials will be sent in the
+       clear.
 
     Directory Configuration:
     1. LDAP_PROXY_BASE_DN : Base DN for directory (default dc=example,dc=org)
@@ -63,6 +72,7 @@ class Configuration():
         self.plain_port = int(os.environ.get('LDAP_PROXY_PORT', '389'))
         self.enable_plain = os.environ.get('LDAP_PROXY_ENABLE_PLAIN', 'false').lower() in ('1', 'true', 'yes')
         self.require_client_cert = os.environ.get('LDAP_PROXY_REQUIRE_CLIENT_CERT', 'false').lower() in ('1', 'true', 'yes')
+        self.require_secure_bind = os.environ.get('LDAP_PROXY_REQUIRE_SECURE_BIND', 'true').lower() in ('1', 'true', 'yes')
 
         # OIDC configuration
         self.url = os.environ.get("LDAP_PROXY_TOKEN_URL")
@@ -72,6 +82,17 @@ class Configuration():
         # Directory configuration
         self.base_dn = os.environ.get("LDAP_PROXY_BASE_DN", "dc=example,dc=org")
         self.domain = os.environ.get("LDAP_PROXY_DOMAIN", "example.org")
+
+        # Fail closed: if mTLS is required, a CA file to verify client certs
+        # against MUST be present. Silently downgrading to server-only TLS
+        # when misconfigured would be a security regression, so refuse to
+        # start instead.
+        if self.require_client_cert and not self.tls_cafile:
+            raise ValueError(
+                "LDAP_PROXY_REQUIRE_CLIENT_CERT is enabled but "
+                "LDAP_PROXY_TLS_CAFILE is not set. Refusing to start with "
+                "mTLS silently disabled."
+            )
 
 
 class OidcProxy(ldapserver.BaseLDAPServer):
@@ -93,12 +114,17 @@ class OidcProxy(ldapserver.BaseLDAPServer):
     # Key: username, Value: {token_data, expires_at}
     _token_cache = {}
     
-    def __init__(self, config, ssl_context_factory=None):
+    def __init__(self, config, ssl_context_factory=None, connection_is_secure=False):
         ldapserver.BaseLDAPServer.__init__(self)
         self.config = config
         self.ssl_context_factory = ssl_context_factory
         self.startTLS_initiated = False
         self.bound_user = None  # Track currently bound user for this connection
+        # Whether this connection is already protected by transport security
+        # (i.e. it originated on the implicit-TLS/LDAPS listener). Connections
+        # on the plain listener start False and flip to True only after a
+        # successful STARTTLS upgrade.
+        self.connection_is_secure = connection_is_secure
 
     def handleUnknown(self, request, controls, reply):
         """
@@ -110,7 +136,9 @@ class OidcProxy(ldapserver.BaseLDAPServer):
         
         Note: STARTTLS is handled by handle_LDAPExtendedRequest.
         """
-        print(repr(request))
+        # NOTE: do not log repr(request) here - LDAPBindRequest carries the
+        # bind password in cleartext and would otherwise end up in logs.
+        print(f"Received request: {request.__class__.__name__}")
         
         if isinstance(request, pureldap.LDAPBindRequest):
             # Handle anonymous bind (empty DN and password) for Root DSE access
@@ -123,6 +151,27 @@ class OidcProxy(ldapserver.BaseLDAPServer):
                 )
                 reply(msg)
                 return None
+
+            # Refuse to process a credentialed bind over an unencrypted
+            # channel, unless explicitly allowed via
+            # LDAP_PROXY_REQUIRE_SECURE_BIND=false. This prevents passwords
+            # from being sent in the clear when plain LDAP is enabled but
+            # the client never issues STARTTLS.
+            if not self.connection_is_secure and self.config.require_secure_bind:
+                print("Rejecting bind: connection is not encrypted "
+                      "(use LDAPS or STARTTLS first, or set "
+                      "LDAP_PROXY_REQUIRE_SECURE_BIND=false to allow plaintext binds)")
+                msg = pureldap.LDAPBindResponse(
+                    resultCode=ldaperrors.LDAPConfidentialityRequired.resultCode,
+                    matchedDN=b'',
+                    errorMessage=b'Confidentiality required: use LDAPS or STARTTLS before binding',
+                )
+                reply(msg)
+                return None
+            elif not self.connection_is_secure:
+                print("Warning: processing bind over unencrypted connection "
+                      "(LDAP_PROXY_REQUIRE_SECURE_BIND=false) - credentials "
+                      "are being sent in the clear")
             
             # Get OIDC token throught password grant
             # Extract username from DN (handle both cn=xxx and uid=xxx)
@@ -139,14 +188,21 @@ class OidcProxy(ldapserver.BaseLDAPServer):
             client_id = self.config.client_id
             client_secret = self.config.client_secret
 
-            payload = 'client_id={client_id}&client_secret={client_secret}&grant_type=password&username={username}&password={password}'.format(client_id=client_id, client_secret=client_secret, username=username.decode('utf-8'), password=password.decode('utf-8'))
-            headers = {
-            'Content-Type': 'application/x-www-form-urlencoded'
+            # Use requests' form-encoding (the `data=` dict) instead of
+            # manual string interpolation. Building the body with
+            # str.format() let username/password values containing '&' or
+            # '=' inject extra form fields into the token request.
+            payload = {
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'grant_type': 'password',
+                'username': username.decode('utf-8'),
+                'password': password.decode('utf-8'),
             }
-            print(url)
-            oidc_response = requests.request("POST", url, headers=headers, data=payload)
+            print(f"Requesting token from OIDC provider for user: {username.decode('utf-8')}")
+            oidc_response = requests.request("POST", url, data=payload)
 
-            # Logging username and status code
+            # Logging username and status code (never log the password)
             print(username.decode('utf-8') + " " + str(oidc_response.status_code))
             
             if oidc_response.status_code == requests.codes['ok']:
@@ -225,6 +281,7 @@ class OidcProxy(ldapserver.BaseLDAPServer):
             print("Upgrading transport to TLS...")
             self.transport.startTLS(self.factory.options)
             self.startTLS_initiated = True
+            self.connection_is_secure = True
             print("STARTTLS negotiation successful, connection upgraded to TLS")
             # Set msg to None so parent doesn't send it again
             msg = None
@@ -241,6 +298,12 @@ class OidcProxy(ldapserver.BaseLDAPServer):
         
         This allows Keycloak (and other LDAP clients) to query user attributes
         after a successful bind operation.
+
+        Authorization: a connection may only ever see the claims of the user
+        that authenticated *on that connection* (self.bound_user). Looking up
+        arbitrary usernames from the shared token cache based on the filter
+        would let any bound (or even anonymous) client read other users'
+        cached claims - this used to be possible and has been removed.
         
         Special handling:
         - Root DSE (base="") - Returns server capabilities for Windows AD compatibility
@@ -252,30 +315,69 @@ class OidcProxy(ldapserver.BaseLDAPServer):
         # Handle Root DSE query (empty base DN)
         if request.baseObject == b'' or request.baseObject == b'""':
             return self._handle_root_dse(request, controls, reply)
-        
-        # Parse the filter to extract username (uid)
-        uid = self._extract_uid_from_filter(request.filter)
-        
-        # Get cached token data for the user
-        if uid and uid in self._token_cache:
-            cache_entry = self._token_cache[uid]
-            # Check if token is still valid
-            if cache_entry['expires_at'] > datetime.now():
-                # Return search result entry with user attributes
-                entry = self._create_search_entry(request.baseObject, uid, cache_entry['claims'], request.attributes)
-                if entry:
-                    reply(entry)
+
+        # LDAP search scopes (RFC 4511): 0=baseObject, 1=singleLevel, 2=wholeSubtree
+        SCOPE_BASE, SCOPE_ONE_LEVEL, SCOPE_SUBTREE = 0, 1, 2
+
+        requested_base = self._normalize_dn(request.baseObject)
+        configured_base = self._normalize_dn(self.config.base_dn)
+
+        # Only ever serve data for the user bound on THIS connection. An
+        # unauthenticated (anonymous-bound) connection has no bound_user and
+        # gets nothing back.
+        if self.bound_user and self.bound_user in self._token_cache:
+            # If the search filter names a specific uid, it must match the
+            # bound user - otherwise this would let a bound user query other
+            # users' cached claims.
+            requested_uid = self._extract_uid_from_filter(request.filter)
+            if requested_uid is not None and requested_uid != self.bound_user:
+                print(f"Denying search: bound user {self.bound_user} "
+                      f"requested data for different uid {requested_uid}")
             else:
-                print(f"Token expired for user {uid}")
-                # Clean up expired entry
-                del self._token_cache[uid]
-        elif self.bound_user and self.bound_user in self._token_cache:
-            # If no uid in filter, use the bound user for this connection
-            cache_entry = self._token_cache[self.bound_user]
-            if cache_entry['expires_at'] > datetime.now():
-                entry = self._create_search_entry(request.baseObject, self.bound_user, cache_entry['claims'], request.attributes)
-                if entry:
-                    reply(entry)
+                cache_entry = self._token_cache[self.bound_user]
+                # Check if token is still valid
+                if cache_entry['expires_at'] > datetime.now():
+                    user_dn = self._normalize_dn(
+                        f"uid={self.bound_user},{self.config.base_dn}"
+                    )
+                    entry = None
+
+                    if requested_base == user_dn and request.scope in (SCOPE_BASE, SCOPE_SUBTREE):
+                        # Client is asking about the user's own entry directly
+                        # (e.g. re-fetching after a search) - return it, with
+                        # no fabricated children.
+                        entry = self._create_search_entry(
+                            self.bound_user, cache_entry['claims'], request.attributes
+                        )
+                    elif requested_base == configured_base and request.scope in (SCOPE_ONE_LEVEL, SCOPE_SUBTREE):
+                        # Client is listing children of the configured base DN
+                        # (e.g. expanding dc=example,dc=org in a browser) -
+                        # return the single user entry as a child.
+                        entry = self._create_search_entry(
+                            self.bound_user, cache_entry['claims'], request.attributes
+                        )
+                    elif requested_base == configured_base and request.scope == SCOPE_BASE:
+                        # Base-scope search directly on the container itself.
+                        # The container isn't modeled as its own entry here,
+                        # so there is nothing to return - not an error.
+                        entry = None
+                    else:
+                        # Base DN doesn't match anything we know about (e.g. a
+                        # one-level search under the user's own DN, which has
+                        # no children). Returning nothing here - rather than
+                        # fabricating a uid=test child under any base we're
+                        # given - is what prevents clients from recursing
+                        # into an infinitely nested fake tree.
+                        print(f"No matching entry for base={requested_base} "
+                              f"scope={request.scope}")
+                        entry = None
+
+                    if entry:
+                        reply(entry)
+                else:
+                    print(f"Token expired for user {self.bound_user}")
+                    # Clean up expired entry
+                    del self._token_cache[self.bound_user]
         
         # Always send search done
         msg = pureldap.LDAPSearchResultDone(
@@ -322,6 +424,18 @@ class OidcProxy(ldapserver.BaseLDAPServer):
         reply(msg)
         return None
     
+    def _normalize_dn(self, dn):
+        """
+        Normalize a DN (bytes or str) for comparison purposes: decode,
+        strip surrounding whitespace/trailing commas, lowercase.
+        This is intentionally simple (no RDN-aware escaping) since the
+        DNs handled by this proxy are all generated by us in a fixed
+        format.
+        """
+        if isinstance(dn, bytes):
+            dn = dn.decode('utf-8')
+        return dn.strip().rstrip(',').lower()
+
     def _extract_uid_from_filter(self, ldap_filter):
         """
         Extract uid (username) from LDAP filter.
@@ -346,7 +460,7 @@ class OidcProxy(ldapserver.BaseLDAPServer):
         
         return None
     
-    def _create_search_entry(self, base_dn, username, claims, requested_attrs):
+    def _create_search_entry(self, username, claims, requested_attrs):
         """
         Create LDAP search result entry from OIDC token claims.
         
@@ -357,7 +471,15 @@ class OidcProxy(ldapserver.BaseLDAPServer):
         - family_name -> sn
         - given_name -> givenName
         - groups/roles -> memberOf
+
+        The entry's DN is always built from the server's configured base
+        DN (self.config.base_dn), never from the client-supplied search
+        base. Previously the search base itself was concatenated in here,
+        which meant every level a client "discovered" became a valid base
+        for the next search, letting a browser recurse into an infinitely
+        nested fake uid=test,uid=test,... tree.
         """
+        base_dn = self.config.base_dn
         # Build DN for the user
         user_dn = f"uid={username},{base_dn.decode('utf-8') if isinstance(base_dn, bytes) else base_dn}"
         
@@ -459,26 +581,46 @@ class OidcProxy(ldapserver.BaseLDAPServer):
     
     def _extract_groups_from_claims(self, claims, base_dn):
         """
-        Extract group memberships from OIDC token claims.
-        Maps groups/roles claims to LDAP group DNs.
+        Extract group/role memberships from OIDC token claims and map them
+        to memberOf DNs, distinguishing groups from roles by OU:
+
+        - claims['groups']                     -> cn=<name>,ou=groups,<base>
+        - claims['realm_access']['roles']       -> cn=<name>,ou=roles,<base>
+        - claims['resource_access'][*]['roles'] -> cn=<name>,ou=roles,<base>
+          (iterated for every client present under resource_access)
         """
         groups = []
+        seen = set()
         base_dn_str = base_dn.decode('utf-8') if isinstance(base_dn, bytes) else base_dn
-        
-        # Check various claim formats
-        group_claims = claims.get('groups', []) or claims.get('roles', []) or claims.get('realm_access', {}).get('roles', [])
-        
-        if isinstance(group_claims, list):
-            for group in group_claims:
-                if isinstance(group, str):
-                    # Convert group name to DN format
-                    group_dn = f"cn={group},ou=groups,{base_dn_str}"
-                    groups.append(group_dn.encode('utf-8'))
-        
+
+        def add_all(names, ou):
+            for name in names:
+                if isinstance(name, str):
+                    key = (ou, name)
+                    if key not in seen:
+                        seen.add(key)
+                        group_dn = f"cn={name},ou={ou},{base_dn_str}"
+                        groups.append(group_dn.encode('utf-8'))
+
+        # groups claim -> ou=groups
+        add_all(claims.get('groups', []) or [], 'groups')
+
+        # realm_access.roles -> ou=roles
+        realm_access = claims.get('realm_access') or {}
+        if isinstance(realm_access, dict):
+            add_all(realm_access.get('roles', []) or [], 'roles')
+
+        # resource_access.<client>.roles -> ou=roles, iterate every client entry
+        resource_access = claims.get('resource_access') or {}
+        if isinstance(resource_access, dict):
+            for client_id, client_claims in resource_access.items():
+                if isinstance(client_claims, dict):
+                    add_all(client_claims.get('roles', []) or [], 'roles')
+
         # Always add Domain Users group for Windows compatibility
         domain_users_dn = f"cn=Domain Users,ou=groups,{base_dn_str}"
         groups.append(domain_users_dn.encode('utf-8'))
-        
+
         return groups if groups else None
     
     def _generate_sid(self, username):
@@ -559,7 +701,10 @@ def create_ssl_context_factory(config):
         extra_options.append(SSL.OP_NO_SSLv3)
         
         # Configure client certificate verification if mTLS is enabled
-        if config.require_client_cert and config.tls_cafile:
+        if config.require_client_cert:
+            # Configuration.__init__ already guarantees tls_cafile is set
+            # whenever require_client_cert is True (fails closed otherwise),
+            # so we don't need to silently fall back here anymore.
             # Load CA certificate for client verification
             with open(config.tls_cafile, 'rb') as ca_file:
                 ca_cert_data = ca_file.read()
@@ -604,16 +749,27 @@ if __name__ == '__main__':
     
     # Create SSL context factory if TLS is configured
     ssl_context_factory = create_ssl_context_factory(config)
-    
-    factory = protocol.ServerFactory()
-    # Set factory.options for STARTTLS support
-    factory.options = ssl_context_factory
-    
-    def buildProtocol():
-        """Build protocol instance for each client connection."""
-        return OidcProxy(config, ssl_context_factory)
 
-    factory.protocol = buildProtocol
+    # ---- Plain (port 389) listener factory ----
+    # Connections here start out NOT secure; they only become secure once
+    # STARTTLS succeeds. Credentialed binds are rejected until then.
+    plain_factory = protocol.ServerFactory()
+    plain_factory.options = ssl_context_factory  # needed for STARTTLS support
+
+    def build_plain_protocol():
+        return OidcProxy(config, ssl_context_factory, connection_is_secure=False)
+
+    plain_factory.protocol = build_plain_protocol
+
+    # ---- LDAPS (implicit TLS) listener factory ----
+    # Connections here are secure from the moment they're established.
+    tls_factory = protocol.ServerFactory()
+    tls_factory.options = ssl_context_factory
+
+    def build_tls_protocol():
+        return OidcProxy(config, ssl_context_factory, connection_is_secure=True)
+
+    tls_factory.protocol = build_tls_protocol
 
     # Configure listeners based on TLS settings
     listeners_started = []
@@ -621,7 +777,7 @@ if __name__ == '__main__':
     # Start plain LDAP listener
     if config.enable_plain or not ssl_context_factory:
         try:
-            reactor.listenTCP(config.plain_port, factory)
+            reactor.listenTCP(config.plain_port, plain_factory)
             listeners_started.append(f'Plain LDAP on port {config.plain_port}')
             print(f'Plain LDAP listening on port {config.plain_port}')
         except Exception as e:
@@ -630,7 +786,7 @@ if __name__ == '__main__':
     if config.tls_certfile and config.tls_keyfile and ssl_context_factory:
         # Start LDAPS listener (implicit TLS on port 636)
         try:
-            reactor.listenSSL(config.tls_port, factory, ssl_context_factory)
+            reactor.listenSSL(config.tls_port, tls_factory, ssl_context_factory)
             listeners_started.append(f'LDAPS on port {config.tls_port}')
             print(f'LDAPS listening on port {config.tls_port}')
         except Exception as e:
